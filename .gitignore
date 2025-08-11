@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.monitor/
+monitor/ui/node_modules/
+monitor/ui/build/
+.chroma_data/
+.ollama/

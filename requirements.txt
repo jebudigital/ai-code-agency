@@ -1,0 +1,11 @@
+flask
+python-dotenv
+requests
+pygithub
+tiktoken
+chromadb
+redis
+pytest
+ruff
+pre-commit
+bandit

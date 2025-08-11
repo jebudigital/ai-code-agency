@@ -1,0 +1,41 @@
+name: Auto Merge Bot
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Auto-merge if approved and labeled
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          AUTO_APPROVE_PR: ${{ secrets.AUTO_APPROVE_PR }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import os, json, sys
+          from github import Github
+          gh = Github(os.environ['GH_PAT'])
+          repo = gh.get_repo(os.environ['GITHUB_REPOSITORY'])
+          # Load event payload
+          event_path = os.environ.get('GITHUB_EVENT_PATH')
+          if not event_path or not os.path.exists(event_path):
+              print('No event payload available. Exiting.')
+              sys.exit(0)
+          payload = json.load(open(event_path))
+          pr = payload.get('pull_request') or payload.get('pull_request')
+          if not pr:
+              print('No pull_request in payload')
+              sys.exit(0)
+          pr_number = pr['number']
+          labels = [l['name'] for l in pr.get('labels',[])]
+          review_state = payload.get('review',{}).get('state','').lower()
+          if review_state == 'approved' and 'auto-merge' in labels and os.environ.get('AUTO_APPROVE_PR','false').lower() == 'true':
+              pr_obj = repo.get_pull(pr_number)
+              pr_obj.merge()
+              print(f'Merged PR #{pr_number}')
+          else:
+              print('Conditions not met for auto-merge:', review_state, labels, os.environ.get('AUTO_APPROVE_PR'))
+          PY

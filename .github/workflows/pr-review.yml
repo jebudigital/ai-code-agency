@@ -1,0 +1,36 @@
+name: PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run ReviewerAgent and post review
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          from github import Github
+          sys.path.append(os.getcwd())
+          from agents.reviewer import ReviewerAgent
+          gh = Github(os.environ['GH_PAT'])
+          repo = gh.get_repo(os.environ['GITHUB_REPOSITORY'])
+          pr_number = int(os.environ['GITHUB_REF'].split('/')[-1])
+          agent = ReviewerAgent(repo, gh)
+          res = agent.review_pr(pr_number)
+          print('REVIEW RESULT:', res)
+          PY
