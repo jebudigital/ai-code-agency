@@ -13,6 +13,14 @@ from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
 from agents.doc_agent import DocumentationAgent
 
+# Import GitHub integration
+try:
+    from utils.github_manager import GitHubProjectManager
+    GITHUB_AVAILABLE = True
+except ImportError:
+    GITHUB_AVAILABLE = False
+    print("Warning: GitHub integration not available. Install PyGithub: pip install PyGithub")
+
 @dataclass
 class ProjectStatus:
     project_id: str
@@ -27,11 +35,19 @@ class ProjectStatus:
     actual_completion: Optional[datetime]
     errors: List[str]
     warnings: List[str]
+    # GitHub integration fields
+    github_repo_name: Optional[str] = None
+    github_repo_url: Optional[str] = None
+    github_clone_url: Optional[str] = None
+    github_project_board_url: Optional[str] = None
 
 class ProjectManagerAgent:
-    def __init__(self, project_path: str = None, model: str = None):
+    def __init__(self, project_path: str = None, model: str = None, use_github: bool = True, 
+                 github_org: str = None):
         self.project_path = Path(project_path) if project_path else Path.cwd()
         self.model = model or os.environ.get('OLLAMA_MODEL', 'phind-codellama:34b-v2')
+        self.use_github = use_github and GITHUB_AVAILABLE
+        self.github_org = github_org or os.environ.get('GITHUB_ORG')
         
         # Initialize all agents
         self.planner = PlannerAgent(model=self.model)
@@ -39,11 +55,26 @@ class ProjectManagerAgent:
         self.reviewer = ReviewerAgent()
         self.doc_agent = DocumentationAgent(model=self.model, project_path=str(self.project_path))
         
+        # Initialize GitHub manager if available
+        self.github_manager = None
+        if self.use_github:
+            try:
+                self.github_manager = GitHubProjectManager(org_name=self.github_org)
+                print("✅ GitHub integration enabled")
+                if self.github_org:
+                    print(f"   Using organization: {self.github_org}")
+                else:
+                    print("   Using user account")
+            except Exception as e:
+                print(f"⚠️  GitHub integration failed: {e}")
+                self.use_github = False
+        
         # Project tracking
         self.active_projects: Dict[str, ProjectStatus] = {}
         self.project_plans: Dict[str, ProjectPlan] = {}
         
-    def create_project(self, title: str, requirements: str, project_id: str = None) -> str:
+    def create_project(self, title: str, requirements: str, project_id: str = None, 
+                      is_private: bool = True) -> str:
         """Create a new project and return project ID"""
         if not project_id:
             project_id = f"proj_{int(time.time())}"
@@ -68,11 +99,43 @@ class ProjectManagerAgent:
             warnings=[]
         )
         
+        # Create GitHub repository if enabled
+        if self.use_github and self.github_manager:
+            try:
+                print("🚀 Creating GitHub repository...")
+                github_repo = self.github_manager.create_project_repository(
+                    title, requirements, is_private
+                )
+                
+                if github_repo:
+                    project_status.github_repo_name = github_repo['repo_name']
+                    project_status.github_repo_url = github_repo['repo_url']
+                    project_status.github_clone_url = github_repo['clone_url']
+                    project_status.github_project_board_url = github_repo['project_board_url']
+                    
+                    print(f"✅ GitHub repository created: {github_repo['repo_url']}")
+                    if github_repo['project_board_url']:
+                        print(f"   Project Board: {github_repo['project_board_url']}")
+                    
+                else:
+                    error_msg = "Failed to create GitHub repository"
+                    project_status.errors.append(error_msg)
+                    print(f"❌ {error_msg}")
+                    
+            except Exception as e:
+                error_msg = f"GitHub integration failed: {e}"
+                project_status.errors.append(error_msg)
+                print(f"⚠️  {error_msg}")
+        
         self.active_projects[project_id] = project_status
         
         print(f"Project '{title}' created with ID: {project_id}")
         print(f"Estimated timeline: {project_plan.timeline_days} days")
         print(f"Total estimated hours: {project_plan.total_estimated_hours}")
+        
+        if project_status.github_repo_url:
+            print(f"🔗 GitHub Repository: {project_status.github_repo_url}")
+            print(f"📋 Project Board: {project_status.github_project_board_url}")
         
         return project_id
     
@@ -111,6 +174,30 @@ class ProjectManagerAgent:
             self._update_status(project_id, "completed", "Project completed successfully")
             project_status.actual_completion = datetime.now()
             
+            # Update GitHub project completion
+            if self.use_github and self.github_manager and project_status.github_repo_name:
+                try:
+                    # Update the "Documentation" issue to completed
+                    self.github_manager.update_project_issue(
+                        project_status.github_repo_name,
+                        "📚 Documentation",
+                        "completed",
+                        "Project documentation completed successfully"
+                    )
+                    
+                    # Update the "Project Complete" issue
+                    self.github_manager.update_project_issue(
+                        project_status.github_repo_name,
+                        "🚀 Project Setup Complete",
+                        "completed",
+                        "Project completed successfully by AI Coding Agency"
+                    )
+                    
+                    print("✅ GitHub project status updated")
+                    
+                except Exception as e:
+                    print(f"⚠️  Failed to update GitHub project status: {e}")
+            
             print(f"Project {project_id} completed successfully!")
             return True
             
@@ -148,6 +235,18 @@ class ProjectManagerAgent:
             setup_task = next((task for task in project_plan.tasks if 'setup' in task.title.lower()), None)
             if setup_task:
                 project_status.completed_tasks.append(setup_task.id)
+                
+                # Update GitHub issue if available
+                if self.use_github and self.github_manager and project_status.github_repo_name:
+                    try:
+                        self.github_manager.update_project_issue(
+                            project_status.github_repo_name,
+                            "🚀 Project Setup Complete",
+                            "completed",
+                            "Project structure setup completed successfully"
+                        )
+                    except Exception as e:
+                        print(f"⚠️  Could not update GitHub issue: {e}")
             
             self._update_progress(project_id)
             return True
@@ -169,12 +268,37 @@ class ProjectManagerAgent:
                 if self._can_execute_task(task, project_status.completed_tasks):
                     self._update_status(project_id, "in_progress", f"Implementing: {task.title}")
                     
+                    # Update GitHub issue if available
+                    if self.use_github and self.github_manager and project_status.github_repo_name:
+                        try:
+                            self.github_manager.update_project_issue(
+                                project_status.github_repo_name,
+                                "💻 Core Implementation",
+                                "in-progress",
+                                f"Starting implementation of: {task.title}"
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Could not update GitHub issue: {e}")
+                    
                     # Generate code for the task
                     code = self.coder.implement_feature(task.description)
                     
                     # Write code to appropriate file
                     if self._write_task_code(task, code):
                         project_status.completed_tasks.append(task.id)
+                        
+                        # Update GitHub issue if available
+                        if self.use_github and self.github_manager and project_status.github_repo_name:
+                            try:
+                                self.github_manager.update_project_issue(
+                                    project_status.github_repo_name,
+                                    "💻 Core Implementation",
+                                    "completed",
+                                    f"Implementation completed for: {task.title}"
+                                )
+                            except Exception as e:
+                                print(f"⚠️  Could not update GitHub issue: {e}")
+                        
                         self._update_progress(project_id)
                     else:
                         raise Exception(f"Failed to write code for task: {task.title}")
@@ -198,6 +322,18 @@ class ProjectManagerAgent:
                 if self._can_execute_task(task, project_status.completed_tasks):
                     self._update_status(project_id, "testing", f"Reviewing: {task.title}")
                     
+                    # Update GitHub issue if available
+                    if self.use_github and self.github_manager and project_status.github_repo_name:
+                        try:
+                            self.github_manager.update_project_issue(
+                                project_status.github_repo_name,
+                                "🧪 Testing & Quality",
+                                "in-progress",
+                                f"Starting review of: {task.title}"
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Could not update GitHub issue: {e}")
+                    
                     # Run tests
                     test_results = self.reviewer.lint_and_test()
                     
@@ -206,11 +342,37 @@ class ProjectManagerAgent:
                     
                     if approved:
                         project_status.completed_tasks.append(task.id)
+                        
+                        # Update GitHub issue if available
+                        if self.use_github and self.github_manager and project_status.github_repo_name:
+                            try:
+                                self.github_manager.update_project_issue(
+                                    project_status.github_repo_name,
+                                    "🧪 Testing & Quality",
+                                    "completed",
+                                    f"Review completed successfully for: {task.title}"
+                                )
+                            except Exception as e:
+                                print(f"⚠️  Could not update GitHub issue: {e}")
+                        
                         self._update_progress(project_id)
                     else:
                         # Try to fix issues
                         if self._fix_code_issues(project_id, notes):
                             project_status.completed_tasks.append(task.id)
+                            
+                            # Update GitHub issue if available
+                            if self.use_github and self.github_manager and project_status.github_repo_name:
+                                try:
+                                    self.github_manager.update_project_issue(
+                                        project_status.github_repo_name,
+                                        "🧪 Testing & Quality",
+                                        "completed",
+                                        f"Review completed after fixing issues for: {task.title}"
+                                    )
+                                except Exception as e:
+                                    print(f"⚠️  Could not update GitHub issue: {e}")
+                            
                             self._update_progress(project_id)
                         else:
                             raise Exception(f"Failed to fix code issues: {notes}")
@@ -234,9 +396,34 @@ class ProjectManagerAgent:
                 if self._can_execute_task(task, project_status.completed_tasks):
                     self._update_status(project_id, "documentation", f"Generating: {task.title}")
                     
+                    # Update GitHub issue if available
+                    if self.use_github and self.github_manager and project_status.github_repo_name:
+                        try:
+                            self.github_manager.update_project_issue(
+                                project_status.github_repo_name,
+                                "📚 Documentation",
+                                "in-progress",
+                                f"Starting documentation generation for: {task.title}"
+                            )
+                        except Exception as e:
+                            print(f"⚠️  Could not update GitHub issue: {e}")
+                    
                     # Generate documentation package
                     if self.doc_agent.generate_project_package():
                         project_status.completed_tasks.append(task.id)
+                        
+                        # Update GitHub issue if available
+                        if self.use_github and self.github_manager and project_status.github_repo_name:
+                            try:
+                                self.github_manager.update_project_issue(
+                                    project_status.github_repo_name,
+                                    "📚 Documentation",
+                                    "completed",
+                                    f"Documentation completed for: {task.title}"
+                                )
+                            except Exception as e:
+                                print(f"⚠️  Could not update GitHub issue: {e}")
+                        
                         self._update_progress(project_id)
                     else:
                         raise Exception(f"Failed to generate documentation for task: {task.title}")
@@ -324,6 +511,32 @@ class ProjectManagerAgent:
                 }
             projects.append(project_info)
         return projects
+    
+    def get_github_project_status(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Get project status from GitHub if available"""
+        if not self.use_github or not self.github_manager:
+            return None
+        
+        project_status = self.active_projects.get(project_id)
+        if not project_status or not project_status.github_repo_name:
+            return None
+        
+        try:
+            return self.github_manager.get_project_status(project_status.github_repo_name)
+        except Exception as e:
+            print(f"Error getting GitHub project status: {e}")
+            return None
+    
+    def list_github_projects(self) -> List[Dict[str, Any]]:
+        """List all GitHub project repositories"""
+        if not self.use_github or not self.github_manager:
+            return []
+        
+        try:
+            return self.github_manager.list_project_repositories()
+        except Exception as e:
+            print(f"Error listing GitHub projects: {e}")
+            return []
     
     def package_project(self, project_id: str, output_path: str = None) -> str:
         """Package completed project for distribution"""

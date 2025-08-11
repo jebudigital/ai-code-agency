@@ -234,6 +234,27 @@ def show_project_status(project_manager: ProjectManagerAgent, project_id: str):
     
     if status.warnings:
         print(f"Warnings: {status.warnings}")
+    
+    # Show GitHub integration info if available
+    if hasattr(status, 'github_repo_url') and status.github_repo_url:
+        print(f"\n🔗 GitHub Integration:")
+        print(f"   Repository: {status.github_repo_url}")
+        print(f"   Clone URL: {status.github_clone_url}")
+        if status.github_project_board_url:
+            print(f"   Project Board: {status.github_project_board_url}")
+        
+        # Get GitHub project status
+        github_status = project_manager.get_github_project_status(project_id)
+        if github_status:
+            print(f"   GitHub Progress: {github_status.get('progress_percentage', 0):.1f}%")
+            print(f"   Total Issues: {github_status.get('total_issues', 0)}")
+            print(f"   Completed: {github_status.get('completed_issues', 0)}")
+            print(f"   In Progress: {github_status.get('in_progress_issues', 0)}")
+            print(f"   Failed: {github_status.get('failed_issues', 0)}")
+            print(f"   Language: {github_status.get('language', 'Unknown')}")
+            print(f"   Created: {github_status.get('created_at', 'Unknown')}")
+        else:
+            print(f"   ❌ No GitHub integration found for project {project_id}")
 
 def interactive_mode(project_manager: ProjectManagerAgent):
     """Run in interactive mode"""
@@ -256,24 +277,42 @@ def interactive_mode(project_manager: ProjectManagerAgent):
                 print("""
 Available commands:
 - help: Show this help message
-- list: List all projects
+- list: List all local projects
+- list-github: List all GitHub project repositories
 - create <title>: Create a new project
 - execute <project_id>: Execute a project
 - status <project_id>: Show project status
 - package <project_id>: Package a completed project
 - sample: Create a sample project
 - logs: Show recent logs
+- github-status <project_id>: Show GitHub project status
+- github-projects: List all GitHub repositories
 - quit: Exit the application
                 """)
             elif command == 'list':
                 list_projects(project_manager)
+            elif command == 'list-github':
+                github_projects = project_manager.list_github_projects()
+                if github_projects:
+                    print(f"\n🔗 GitHub Project Repositories ({len(github_projects)}):")
+                    print("=" * 60)
+                    for repo in github_projects:
+                        print(f"📁 {repo['repo_name']}")
+                        print(f"   URL: {repo['repo_url']}")
+                        print(f"   Language: {repo.get('language', 'Unknown')}")
+                        print(f"   Created: {repo.get('created_at', 'Unknown')}")
+                        print(f"   Private: {'Yes' if repo['private'] else 'No'}")
+                        print()
+                else:
+                    print("❌ No GitHub project repositories found")
             elif command.startswith('create '):
                 title = command[7:].strip()
                 if title:
                     requirements = input("Enter project requirements: ")
+                    is_private = input("Make repository private? (y/n, default: y): ").lower() != 'n'
                     if logger:
                         logger.info(f"Creating project: {title}")
-                    project_id = project_manager.create_project(title, requirements)
+                    project_id = project_manager.create_project(title, requirements, is_private=is_private)
                     print(f"✅ Project created with ID: {project_id}")
                 else:
                     print("❌ Please provide a project title.")
@@ -310,6 +349,40 @@ Available commands:
                         print(f"❌ Failed to export logs: {e}")
                 else:
                     print("❌ Logging system not available")
+            elif command.startswith('github-status '):
+                project_id = command[15:].strip()
+                if project_id:
+                    github_status = project_manager.get_github_project_status(project_id)
+                    if github_status:
+                        print(f"\n🔗 GitHub Project Status for {project_id}:")
+                        print("=" * 50)
+                        print(f"Repository: {github_status.get('repo_name', 'Unknown')}")
+                        print(f"Progress: {github_status.get('progress_percentage', 0):.1f}%")
+                        print(f"Total Issues: {github_status.get('total_issues', 0)}")
+                        print(f"Completed: {github_status.get('completed_issues', 0)}")
+                        print(f"In Progress: {github_status.get('in_progress_issues', 0)}")
+                        print(f"Planning: {github_status.get('planning_issues', 0)}")
+                        print(f"Failed: {github_status.get('failed_issues', 0)}")
+                        print(f"Language: {github_status.get('language', 'Unknown')}")
+                        print(f"Created: {github_status.get('created_at', 'Unknown')}")
+                    else:
+                        print(f"❌ No GitHub integration found for project {project_id}")
+                else:
+                    print("❌ Please provide a project ID.")
+            elif command == 'github-projects':
+                github_projects = project_manager.list_github_projects()
+                if github_projects:
+                    print(f"\n🔗 GitHub Project Repositories ({len(github_projects)}):")
+                    print("=" * 60)
+                    for repo in github_projects:
+                        print(f"📁 {repo['repo_name']}")
+                        print(f"   URL: {repo['repo_url']}")
+                        print(f"   Language: {repo.get('language', 'Unknown')}")
+                        print(f"   Created: {repo.get('created_at', 'Unknown')}")
+                        print(f"   Private: {'Yes' if repo['private'] else 'No'}")
+                        print()
+                else:
+                    print("❌ No GitHub project repositories found")
             else:
                 print("❌ Unknown command. Type 'help' for available commands.")
                 
@@ -337,8 +410,10 @@ Examples:
   python main.py --interactive                    # Run in interactive mode
   python main.py --create-sample                 # Create and execute sample project
   python main.py --execute-project proj_123      # Execute specific project
-  python main.py --list-projects                 # List all projects
+  python main.py --list-projects                 # List all local projects
+  python main.py --list-github                   # List all GitHub repositories
   python main.py --status proj_123               # Show project status
+  python main.py --github-status proj_123        # Show GitHub project status
         """
     )
     
@@ -349,11 +424,15 @@ Examples:
     parser.add_argument('--execute-project', metavar='PROJECT_ID',
                        help='Execute a specific project by ID')
     parser.add_argument('--list-projects', action='store_true',
-                       help='List all projects and their status')
+                       help='List all local projects and their status')
+    parser.add_argument('--list-github', action='store_true',
+                       help='List all GitHub project repositories')
     parser.add_argument('--status', metavar='PROJECT_ID',
                        help='Show detailed status of a specific project')
     parser.add_argument('--package', metavar='PROJECT_ID',
                        help='Package a completed project for distribution')
+    parser.add_argument('--github-status', metavar='PROJECT_ID',
+                       help='Show GitHub project status')
     parser.add_argument('--project-path', metavar='PATH',
                        help='Path to project directory (default: current directory)')
     parser.add_argument('--model', metavar='MODEL',
@@ -361,6 +440,10 @@ Examples:
     parser.add_argument('--log-level', metavar='LEVEL', default='INFO',
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Logging level (default: INFO)')
+    parser.add_argument('--no-github', action='store_true',
+                       help='Disable GitHub integration')
+    parser.add_argument('--github-org', metavar='ORG_NAME',
+                       help='GitHub organization name (default: user account)')
     
     args = parser.parse_args()
     
@@ -375,7 +458,9 @@ Examples:
         
         project_manager = ProjectManagerAgent(
             project_path=args.project_path,
-            model=args.model
+            model=args.model,
+            use_github=not args.no_github,
+            github_org=args.github_org
         )
         print("✅ AI Coding Agency initialized successfully!")
         
@@ -395,8 +480,29 @@ Examples:
         execute_project(project_manager, args.execute_project)
     elif args.list_projects:
         list_projects(project_manager)
+    elif args.list_github:
+        github_projects = project_manager.list_github_projects()
+        if github_projects:
+            print(f"\n🔗 GitHub Project Repositories ({len(github_projects)}):")
+            print("=" * 60)
+            for repo in github_projects:
+                print(f"📁 {repo['repo_name']}")
+                print(f"   URL: {repo['repo_url']}")
+                print(f"   Language: {repo.get('language', 'Unknown')}")
+                print(f"   Created: {repo.get('created_at', 'Unknown')}")
+                print(f"   Private: {'Yes' if repo['private'] else 'No'}")
+                print()
+        else:
+            print("❌ No GitHub project repositories found")
     elif args.status:
         show_project_status(project_manager, args.status)
+    elif args.github_status:
+        github_status = project_manager.get_github_project_status(args.github_status)
+        if github_status:
+            print(f"🔗 GitHub Project Status for {args.github_status}:")
+            print(json.dumps(github_status, indent=2))
+        else:
+            print(f"❌ No GitHub integration found for project {args.github_status}")
     elif args.package:
         try:
             package_path = project_manager.package_project(args.package)
@@ -404,7 +510,8 @@ Examples:
         except Exception as e:
             print(f"❌ Failed to package project: {e}")
     elif args.interactive or not any([args.create_sample, args.execute_project, 
-                                     args.list_projects, args.status, args.package]):
+                                     args.list_projects, args.list_github, args.status, 
+                                     args.package, args.github_status]):
         interactive_mode(project_manager)
     else:
         parser.print_help()
