@@ -1,11 +1,30 @@
-flask
-python-dotenv
-requests
-pygithub
-tiktoken
-chromadb
-redis
-pytest
-ruff
-pre-commit
-bandit
+# Core dependencies
+flask>=2.3.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+pygithub>=1.59.0
+tiktoken>=0.5.0
+chromadb>=0.4.0
+redis>=4.6.0
+
+# Testing and quality
+pytest>=7.4.0
+pytest-cov>=4.1.0
+ruff>=0.1.0
+black>=23.0.0
+bandit>=1.7.0
+pre-commit>=3.4.0
+
+# Documentation
+mkdocs>=1.5.0
+mkdocs-material>=9.2.0
+mkdocs-mermaid2-plugin>=0.6.0
+
+# Development tools
+pathlib2>=2.3.7
+typing-extensions>=4.7.0
+
+# Optional: For enhanced monitoring and UI
+streamlit>=1.28.0
+plotly>=5.17.0
+pandas>=2.0.0

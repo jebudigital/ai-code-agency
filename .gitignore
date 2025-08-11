@@ -7,3 +7,4 @@ monitor/ui/node_modules/
 monitor/ui/build/
 .chroma_data/
 .ollama/
+logs/*
