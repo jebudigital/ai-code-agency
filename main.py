@@ -13,6 +13,13 @@ import argparse
 from pathlib import Path
 from typing import Dict, Any
 
+# Add dotenv support to load .env automatically
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("Warning: python-dotenv not installed. Install with: pip install python-dotenv")
+
 # Add the current directory to Python path so we can import agents
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))

@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta
 import base64
+import requests
 
 try:
     from github import Github, GithubException
@@ -26,6 +27,67 @@ try:
 except ImportError:
     print("PyGithub not installed. Install with: pip install PyGithub")
     Github = None
+
+class GitHubGraphQLManager:
+    """Handles GitHub GraphQL API for Projects (beta) board automation."""
+    def __init__(self, token: str):
+        self.token = token
+        self.endpoint = "https://api.github.com/graphql"
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json"
+        }
+
+    def run_query(self, query: str, variables: dict = None):
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        response = requests.post(self.endpoint, json=payload, headers=self.headers)
+        if response.status_code != 200:
+            raise Exception(f"GraphQL query failed: {response.status_code} {response.text}")
+        data = response.json()
+        if "errors" in data:
+            raise Exception(f"GraphQL error: {data['errors']}")
+        return data["data"]
+
+    def get_viewer_id(self):
+        query = """
+        query { viewer { id login } }
+        """
+        return self.run_query(query)["viewer"]
+
+    def create_project(self, owner_id: str, name: str, body: str = ""):
+        query = """
+        mutation($ownerId:ID!, $name:String!, $body:String) {
+          createProjectV2(input: {ownerId: $ownerId, title: $name, shortDescription: $body}) {
+            projectV2 { id title url }
+          }
+        }
+        """
+        variables = {"ownerId": owner_id, "name": name, "body": body}
+        return self.run_query(query, variables)["createProjectV2"]["projectV2"]
+
+    def add_field(self, project_id: str, name: str, data_type: str = "TEXT"):
+        query = """
+        mutation($projectId:ID!, $name:String!, $dataType:ProjectV2FieldType!) {
+          addProjectV2Field(input: {projectId: $projectId, name: $name, dataType: $dataType}) {
+            projectV2Field { id name dataType }
+          }
+        }
+        """
+        variables = {"projectId": project_id, "name": name, "dataType": data_type}
+        return self.run_query(query, variables)["addProjectV2Field"]["projectV2Field"]
+
+    def add_item(self, project_id: str, content_id: str):
+        query = """
+        mutation($projectId:ID!, $contentId:ID!) {
+          addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+            item { id }
+          }
+        }
+        """
+        variables = {"projectId": project_id, "contentId": content_id}
+        return self.run_query(query, variables)["addProjectV2ItemById"]["item"]
 
 class GitHubProjectManager:
     """Manages GitHub repositories and project boards for AI Coding Agency"""
@@ -61,10 +123,13 @@ class GitHubProjectManager:
     
     def create_project_repository(self, project_name: str, description: str, is_private: bool = True, 
                                 template_repo: str = None) -> Dict[str, Any]:
-        """Create a new repository for a specific project"""
+        """Create a new repository for a specific project, and a new Projects (beta) board via GraphQL."""
         try:
             # Clean project name for repo
             repo_name = self._clean_repo_name(project_name)
+            
+            # Truncate description to 350 characters (GitHub API limit)
+            safe_description = (description or "")[:350]
             
             # Check if repo already exists
             try:
@@ -80,7 +145,7 @@ class GitHubProjectManager:
             if self.org:
                 repo = self.org.create_repo(
                     name=repo_name,
-                    description=description,
+                    description=safe_description,
                     private=is_private,
                     auto_init=True,
                     gitignore_template="Python",
@@ -89,7 +154,7 @@ class GitHubProjectManager:
             else:
                 repo = self.user.create_repo(
                     name=repo_name,
-                    description=description,
+                    description=safe_description,
                     private=is_private,
                     auto_init=True,
                     gitignore_template="Python",
@@ -98,26 +163,48 @@ class GitHubProjectManager:
             
             # Set up project structure
             self._setup_project_repo_structure(repo, project_name, description)
-            
-            # Create project board
-            project_board = self._create_project_board(repo)
-            
-            # Create initial issues for project phases
-            self._create_project_phase_issues(repo, project_board)
-            
+
+            # --- New: Create Projects (beta) board via GraphQL ---
+            graphql_manager = GitHubGraphQLManager(self.token)
+            owner_login = self.org_name if self.org_name else self.user.login
+            # Get owner id (user or org)
+            owner_query = '''
+            query($login: String!) {
+              user(login: $login) { id login }
+              organization(login: $login) { id login }
+            }
+            '''
+            owner_data = graphql_manager.run_query(owner_query, {"login": owner_login})
+            owner_id = None
+            if owner_data.get("organization") and owner_data["organization"]:
+                owner_id = owner_data["organization"]["id"]
+            elif owner_data.get("user") and owner_data["user"]:
+                owner_id = owner_data["user"]["id"]
+            if not owner_id:
+                raise Exception(f"Could not find owner id for login: {owner_login}")
+            # Create the project board
+            project_board = graphql_manager.create_project(owner_id, f"{project_name} Development Board", description)
+            project_board_url = project_board["url"] if project_board else None
+            print(f"  ✅ Created Projects (beta) board: {project_board_url}")
+            # --- End new GraphQL logic ---
+
+            # Create initial issues for project phases (existing logic)
+            self._create_project_phase_issues(repo, None)  # No classic board
+
             print(f"✅ Repository created successfully: {repo.html_url}")
-            
             return {
                 'repo_name': repo.full_name,
                 'repo_url': repo.html_url,
                 'clone_url': repo.clone_url,
                 'ssh_url': repo.ssh_url,
                 'private': repo.private,
-                'project_board_url': project_board.html_url if project_board else None
+                'project_board_url': project_board_url
             }
-            
         except GithubException as e:
             print(f"Error creating project repository: {e}")
+            return None
+        except Exception as e:
+            print(f"Error (GraphQL) creating project board: {e}")
             return None
     
     def _clean_repo_name(self, project_name: str) -> str:
@@ -135,6 +222,27 @@ class GitHubProjectManager:
         timestamp = str(int(time.time()))[-6:]  # Last 6 digits of timestamp
         return f"{cleaned}-{timestamp}"
     
+    def _create_or_update_file(self, repo: Repository, path: str, content: str, message: str) -> str:
+        """Create a file if missing, otherwise update it; returns 'created' or 'updated'"""
+        try:
+            existing = repo.get_contents(path, ref='main')
+            # If content is identical, do nothing
+            try:
+                existing_content = existing.decoded_content.decode('utf-8') if hasattr(existing, 'decoded_content') else ''
+            except Exception:
+                existing_content = ''
+            if existing_content == content:
+                return 'skipped'
+            repo.update_file(path=path, message=message, content=content, sha=existing.sha, branch='main')
+            return 'updated'
+        except GithubException as ge:
+            # If not found, create it
+            if getattr(ge, 'status', None) == 404 or 'Not Found' in str(ge):
+                repo.create_file(path=path, message=message, content=content, branch='main')
+                return 'created'
+            # Re-raise other errors
+            raise
+
     def _setup_project_repo_structure(self, repo: Repository, project_name: str, description: str):
         """Set up initial repository structure with README and project files"""
         try:
@@ -317,35 +425,28 @@ htmlcov/
 .ipynb_checkpoints
 """
             
-            # Create initial files
+            # Create initial files (create or update to avoid 422 errors)
             files_to_create = [
-                ('README.md', readme_content),
-                ('PROJECT_STRUCTURE.md', structure_content),
-                ('requirements.txt', requirements_content),
-                ('.gitignore', gitignore_content),
-                ('src/__init__.py', '# Source package\n'),
-                ('tests/__init__.py', '# Tests package\n'),
-                ('docs/README.md', '# Documentation\n\nDocumentation will be generated here.\n')
+                ('README.md', readme_content, 'Add or update README.md'),
+                ('PROJECT_STRUCTURE.md', structure_content, 'Add or update PROJECT_STRUCTURE.md'),
+                ('requirements.txt', requirements_content, 'Add or update requirements.txt'),
+                ('.gitignore', gitignore_content, 'Add or update .gitignore'),
+                ('src/__init__.py', '# Source package\n', 'Add or update src/__init__.py'),
+                ('tests/__init__.py', '# Tests package\n', 'Add or update tests/__init__.py'),
+                ('docs/README.md', '# Documentation\n\nDocumentation will be generated here.\n', 'Add or update docs/README.md'),
             ]
             
-            for file_path, content in files_to_create:
+            for file_path, content, message in files_to_create:
                 try:
-                    # Create directory if needed
-                    dir_path = os.path.dirname(file_path)
-                    if dir_path and not os.path.exists(dir_path):
-                        os.makedirs(dir_path, exist_ok=True)
-                    
-                    # Create file in repo
-                    repo.create_file(
-                        path=file_path,
-                        message=f"Add {file_path}",
-                        content=content,
-                        branch='main'
-                    )
-                    print(f"  ✅ Created {file_path}")
-                    
+                    result = self._create_or_update_file(repo, file_path, content, message)
+                    if result == 'created':
+                        print(f"  ✅ Created {file_path}")
+                    elif result == 'updated':
+                        print(f"  🔄 Updated {file_path}")
+                    else:
+                        print(f"  ⏭️  Skipped {file_path} (no changes)")
                 except GithubException as e:
-                    print(f"  ⚠️  Could not create {file_path}: {e}")
+                    print(f"  ⚠️  Could not write {file_path}: {e}")
             
             # Create main branch protection if organization
             if self.org:
@@ -677,3 +778,11 @@ def list_project_repos(org_name: str = None) -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"Error listing project repositories: {e}")
         return []
+
+# Usage notes:
+# - To use the new Projects (beta) automation, you must generate a GitHub PAT with the following scopes:
+#   - repo (for private repos)
+#   - project (for project management)
+#   - read:org (if using organization projects)
+# - The GraphQL API is required for all new project board automation.
+# - See https://docs.github.com/en/issues/planning-and-tracking-with-projects/automating-your-project/using-the-api-to-manage-projects
