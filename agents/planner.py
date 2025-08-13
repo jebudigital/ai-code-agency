@@ -3,6 +3,7 @@ import json
 import subprocess
 import shutil
 import time
+import re
 from typing import Dict, List, Any
 from dataclasses import dataclass
 
@@ -192,6 +193,12 @@ class PlannerAgent:
         
         return ""
 
+    def _clean_json(self, json_str: str) -> str:
+        """Remove trailing commas before closing brackets in JSON string."""
+        # Remove trailing commas before ] or }
+        cleaned = re.sub(r',\s*([}\]])', r'\1', json_str)
+        return cleaned
+
     def analyze_requirements(self, requirements_text: str) -> Dict[str, Any]:
         """Analyze functional requirements and extract key information"""
         if logger:
@@ -219,6 +226,7 @@ class PlannerAgent:
                 start = response.find('{')
                 end = response.rfind('}') + 1
                 json_str = response[start:end]
+                json_str = self._clean_json(json_str)
                 result = json.loads(json_str)
                 
                 if logger:

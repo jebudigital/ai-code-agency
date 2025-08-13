@@ -46,9 +46,10 @@ class GitHubGraphQLManager:
         if response.status_code != 200:
             raise Exception(f"GraphQL query failed: {response.status_code} {response.text}")
         data = response.json()
-        if "errors" in data:
+        # Allow partial data responses (e.g., querying both user and organization)
+        if data.get("errors") and not data.get("data"):
             raise Exception(f"GraphQL error: {data['errors']}")
-        return data["data"]
+        return data.get("data", {})
 
     def get_viewer_id(self):
         query = """
@@ -58,14 +59,46 @@ class GitHubGraphQLManager:
 
     def create_project(self, owner_id: str, name: str, body: str = ""):
         query = """
-        mutation($ownerId:ID!, $name:String!, $body:String) {
-          createProjectV2(input: {ownerId: $ownerId, title: $name, shortDescription: $body}) {
+        mutation($ownerId:ID!, $name:String!) {
+          createProjectV2(input: {ownerId: $ownerId, title: $name}) {
             projectV2 { id title url }
           }
         }
         """
-        variables = {"ownerId": owner_id, "name": name, "body": body}
+        variables = {"ownerId": owner_id, "name": name}
         return self.run_query(query, variables)["createProjectV2"]["projectV2"]
+
+    def get_owner_id_by_login(self, login: str) -> dict:
+        """Resolve a login to either a User or Organization node id.
+        Returns dict { 'id': str, 'type': 'USER'|'ORG' }
+        """
+        # Try user first
+        user_q = """
+        query($login:String!) { user(login:$login) { id login } }
+        """
+        data = self.run_query(user_q, {"login": login})
+        if data and data.get("user"):
+            return {"id": data["user"]["id"], "type": "USER"}
+        # Then org
+        org_q = """
+        query($login:String!) { organization(login:$login) { id login } }
+        """
+        data = self.run_query(org_q, {"login": login})
+        if data and data.get("organization"):
+            return {"id": data["organization"]["id"], "type": "ORG"}
+        raise Exception(f"Could not resolve login '{login}' to a user or organization")
+
+    def get_issue_node_id(self, owner: str, repo: str, issue_number: int) -> Optional[str]:
+        query = """
+        query($owner:String!, $repo:String!, $num:Int!) {
+          repository(owner:$owner, name:$repo) {
+            issue(number:$num) { id }
+          }
+        }
+        """
+        data = self.run_query(query, {"owner": owner, "repo": repo, "num": issue_number})
+        node = (((data or {}).get("repository") or {}).get("issue") or {})
+        return node.get("id") if node else None
 
     def add_field(self, project_id: str, name: str, data_type: str = "TEXT"):
         query = """
@@ -88,6 +121,55 @@ class GitHubGraphQLManager:
         """
         variables = {"projectId": project_id, "contentId": content_id}
         return self.run_query(query, variables)["addProjectV2ItemById"]["item"]
+
+    def get_project_fields(self, project_id: str) -> dict:
+        query = """
+        query($projectId:ID!) {
+          node(id:$projectId) {
+            ... on ProjectV2 {
+              fields(first: 50) {
+                nodes {
+                  __typename
+                  ... on ProjectV2SingleSelectField {
+                    id
+                    name
+                    options { id name }
+                  }
+                  ... on ProjectV2FieldCommon { id name }
+                }
+              }
+            }
+          }
+        }
+        """
+        data = self.run_query(query, {"projectId": project_id})
+        return (((data or {}).get("node") or {}).get("fields") or {}).get("nodes", [])
+
+    def create_single_select_option(self, project_id: str, field_id: str, name: str, color: str = "GRAY") -> dict:
+        query = """
+        mutation($projectId:ID!, $fieldId:ID!, $name:String!, $color:ProjectV2SingleSelectFieldOptionColor!) {
+          createProjectV2SingleSelectFieldOption(input:{projectId:$projectId, fieldId:$fieldId, name:$name, color:$color}) {
+            projectV2SingleSelectFieldOption { id name }
+          }
+        }
+        """
+        variables = {"projectId": project_id, "fieldId": field_id, "name": name, "color": color}
+        return self.run_query(query, variables)["createProjectV2SingleSelectFieldOption"]["projectV2SingleSelectFieldOption"]
+
+    def set_item_single_select(self, project_id: str, item_id: str, field_id: str, option_id: str) -> bool:
+        query = """
+        mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+          updateProjectV2ItemFieldValue(input:{
+            projectId:$projectId,
+            itemId:$itemId,
+            fieldId:$fieldId,
+            value:{ singleSelectOptionId:$optionId }
+          }) { projectV2Item { id } }
+        }
+        """
+        variables = {"projectId": project_id, "itemId": item_id, "fieldId": field_id, "optionId": option_id}
+        _ = self.run_query(query, variables)
+        return True
 
 class GitHubProjectManager:
     """Manages GitHub repositories and project boards for AI Coding Agency"""
@@ -166,30 +248,135 @@ class GitHubProjectManager:
 
             # --- New: Create Projects (beta) board via GraphQL ---
             graphql_manager = GitHubGraphQLManager(self.token)
-            owner_login = self.org_name if self.org_name else self.user.login
-            # Get owner id (user or org)
-            owner_query = '''
-            query($login: String!) {
-              user(login: $login) { id login }
-              organization(login: $login) { id login }
-            }
-            '''
-            owner_data = graphql_manager.run_query(owner_query, {"login": owner_login})
-            owner_id = None
-            if owner_data.get("organization") and owner_data["organization"]:
-                owner_id = owner_data["organization"]["id"]
-            elif owner_data.get("user") and owner_data["user"]:
-                owner_id = owner_data["user"]["id"]
-            if not owner_id:
-                raise Exception(f"Could not find owner id for login: {owner_login}")
-            # Create the project board
-            project_board = graphql_manager.create_project(owner_id, f"{project_name} Development Board", description)
-            project_board_url = project_board["url"] if project_board else None
-            print(f"  ✅ Created Projects (beta) board: {project_board_url}")
+            # Determine correct owner login (org if available, otherwise user)
+            owner_login = getattr(self.repo_owner, 'login', None) or (self.org_name if self.org_name else self.user.login)
+            try:
+                owner_info = graphql_manager.get_owner_id_by_login(owner_login)
+                owner_id = owner_info["id"]
+                project_board = graphql_manager.create_project(owner_id, f"{project_name} Development Board")
+                project_board_url = project_board["url"] if project_board else None
+                project_board_id = project_board["id"] if project_board else None
+                if project_board_url:
+                    print(f"  ✅ Created Projects (beta) board: {project_board_url}")
+                else:
+                    print("  ⚠️  Created Projects (beta) board but no URL returned")
+            except Exception as e:
+                project_board_url = None
+                project_board_id = None
+                print(f"  ⚠️  Could not create Projects (beta) board: {e}")
+            # Ensure a Status single-select field exists with options mapped to labels
+            status_field_id = None
+            status_options_by_name = {}
+            if project_board_id:
+                try:
+                    fields = graphql_manager.get_project_fields(project_board_id)
+                    for f in fields:
+                        if f.get('__typename') == 'ProjectV2SingleSelectField' and f.get('name') == 'Status':
+                            status_field_id = f['id']
+                            for opt in (f.get('options') or []):
+                                status_options_by_name[opt['name']] = opt['id']
+                            break
+                    if not status_field_id:
+                        created = graphql_manager.add_field(project_board_id, 'Status', 'SINGLE_SELECT')
+                        status_field_id = created['id']
+                        status_options_by_name = {}
+                    desired = [
+                        ('Planning', 'GRAY'),
+                        ('In Progress', 'BLUE'),
+                        ('Review', 'YELLOW'),
+                        ('Testing', 'PURPLE'),
+                        ('Completed', 'GREEN'),
+                        ('Failed', 'RED')
+                    ]
+                    for name, color in desired:
+                        if name not in status_options_by_name:
+                            opt = graphql_manager.create_single_select_option(project_board_id, status_field_id, name, color)
+                            status_options_by_name[name] = opt['id']
+                except Exception as e:
+                    print(f"  ⚠️  Could not ensure Status field/options: {e}")
             # --- End new GraphQL logic ---
 
-            # Create initial issues for project phases (existing logic)
-            self._create_project_phase_issues(repo, None)  # No classic board
+            # Create initial issues for project phases and add to project board
+            created_issues = []
+            phases = [
+                {
+                    'title': '🚀 Project Setup Complete',
+                    'body': 'Repository and project structure have been initialized.',
+                    'labels': ['phase:setup', 'status:completed'],
+                },
+                {
+                    'title': '📋 Requirements Analysis',
+                    'body': 'Analyze project requirements and create detailed specifications.',
+                    'labels': ['phase:planning', 'status:planning'],
+                },
+                {
+                    'title': '🏗️ Architecture Design',
+                    'body': 'Design system architecture and technical specifications.',
+                    'labels': ['phase:planning', 'status:planning'],
+                },
+                {
+                    'title': '💻 Core Implementation',
+                    'body': 'Implement core functionality and features.',
+                    'labels': ['phase:implementation', 'status:planning'],
+                },
+                {
+                    'title': '🧪 Testing & Quality',
+                    'body': 'Run comprehensive tests and quality checks.',
+                    'labels': ['phase:testing', 'status:planning'],
+                },
+                {
+                    'title': '📚 Documentation',
+                    'body': 'Generate comprehensive project documentation.',
+                    'labels': ['phase:documentation', 'status:planning'],
+                }
+            ]
+            self._ensure_phase_labels(repo)
+            for phase in phases:
+                try:
+                    issue = repo.create_issue(
+                        title=phase['title'],
+                        body=phase['body'],
+                        labels=phase['labels']
+                    )
+                    print(f"  ✅ Created issue: {phase['title']}")
+                    created_issues.append(issue)
+                    # Add to Projects (beta) board via GraphQL
+                    if project_board_id:
+                        try:
+                            # Prefer node_id if available; otherwise resolve via GraphQL
+                            content_node_id = getattr(issue, 'node_id', None)
+                            if not content_node_id:
+                                content_node_id = graphql_manager.get_issue_node_id(repo.owner.login, repo.name, issue.number)
+                            item_node = None
+                            if content_node_id:
+                                item_node = graphql_manager.add_item(project_board_id, content_node_id)
+                            # Set Status single-select from labels
+                            if item_node and status_field_id:
+                                labels = [l.name for l in issue.labels]
+                                status_name = 'Planning'
+                                if 'status:completed' in labels:
+                                    status_name = 'Completed'
+                                elif 'status:in-progress' in labels:
+                                    status_name = 'In Progress'
+                                elif 'status:review' in labels:
+                                    status_name = 'Review'
+                                elif 'status:testing' in labels:
+                                    status_name = 'Testing'
+                                elif 'status:failed' in labels:
+                                    status_name = 'Failed'
+                                option_id = status_options_by_name.get(status_name)
+                                if option_id:
+                                    try:
+                                        graphql_manager.set_item_single_select(project_board_id, item_node['id'], status_field_id, option_id)
+                                    except Exception as se:
+                                        print(f"    ⚠️  Could not set Status for '{phase['title']}': {se}")
+                            else:
+                                raise Exception("Could not resolve issue node id")
+                            print(f"    ➕ Added issue '{phase['title']}' to project board")
+                        except Exception as e:
+                            print(f"    ⚠️  Could not add issue '{phase['title']}' to project board: {e}")
+                except GithubException as e:
+                    print(f"  ⚠️  Could not create issue {phase['title']}: {e}")
 
             print(f"✅ Repository created successfully: {repo.html_url}")
             return {
@@ -204,8 +391,19 @@ class GitHubProjectManager:
             print(f"Error creating project repository: {e}")
             return None
         except Exception as e:
+            # Do not fail the entire repo creation if project board failed
             print(f"Error (GraphQL) creating project board: {e}")
-            return None
+            try:
+                return {
+                    'repo_name': repo.full_name,
+                    'repo_url': repo.html_url,
+                    'clone_url': repo.clone_url,
+                    'ssh_url': repo.ssh_url,
+                    'private': repo.private,
+                    'project_board_url': None
+                }
+            except Exception:
+                return None
     
     def _clean_repo_name(self, project_name: str) -> str:
         """Clean project name to valid repository name"""
